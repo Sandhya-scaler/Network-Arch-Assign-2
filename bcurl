@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""bcurl [-v] HOST:PORT/PATH [...] -- BHTTP v1 client (see SPEC.md).
+All URLs are fetched over ONE TCP connection. Exit 0 ok, 1 on 4xx/5xx, 2 on error."""
+import os, socket, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import bhttp as B
+
+
+def parse_url(u):
+    if u.startswith("http://"):
+        u = u[7:]
+    hostport, slash, path = u.partition("/")
+    host, _, port = hostport.rpartition(":")
+    if not host:
+        host, port = hostport, "80"
+    if not port.isdigit() or not host:
+        raise ValueError("bad URL: %s" % u)
+    return host, int(port), "/" + path
+
+
+def read_frame(sock, verbose):
+    """Read one whole frame -> (type, flags, stream, payload). Dumps if verbose."""
+    hdr = B.read_header(sock)
+    if hdr is None:
+        raise B.Truncated("server closed connection")
+    _, ftype, flags, stream, length = hdr
+    payload = B.read_exact(sock, length) if length else b""
+    if len(payload) != length:
+        raise B.Truncated("short payload")
+    if verbose:
+        raw = B.HEADER.pack(B.VERSION, ftype, flags, stream, length) + payload
+        print(B.dump_frame("<", raw), file=sys.stderr)
+    return ftype, flags, stream, payload
+
+
+def fetch(sock, host, port, path, stream, verbose, out):
+    hdrs = [(":method", "GET"), (":path", path), ("host", "%s:%d" % (host, port)),
+            ("user-agent", "bcurl/1"), ("accept", "*/*"), ("x-client", "bcurl")]
+    frame = B.pack_frame(B.T_REQUEST, B.F_END_STREAM, stream, B.encode_headers(hdrs))
+    if verbose:
+        print(B.dump_frame(">", frame), file=sys.stderr)
+    B.write_all(sock, frame)
+    status, headers, got = None, {}, 0
+    while True:
+        ftype, flags, sid, payload = read_frame(sock, verbose)
+        if sid not in (stream, 0):
+            continue                                  # not ours (stream 0 = connection-level error)
+        if ftype == B.T_RESPONSE and status is None:
+            headers = dict(B.decode_headers(payload))
+            status = int(headers[":status"])
+        elif ftype == B.T_DATA and status is not None:
+            out.write(payload); got += len(payload)
+            if flags & B.F_END_STREAM:
+                break
+        # any other frame type: skipped
+    if "content-length" in headers and int(headers["content-length"]) != got:
+        raise B.ProtocolError("content-length %s but received %d" % (headers["content-length"], got))
+    return status
+
+
+def main():
+    args = sys.argv[1:]
+    verbose = False
+    if args and args[0] == "-v":
+        verbose, args = True, args[1:]
+    if not args:
+        sys.exit("usage: bcurl [-v] HOST:PORT/PATH [HOST:PORT/PATH ...]")
+    try:
+        targets = [parse_url(a) for a in args]
+        if len({(h, p) for h, p, _ in targets}) != 1:
+            raise ValueError("all URLs must share one host:port (single connection)")
+        host, port = targets[0][:2]
+        sock = socket.create_connection((host, port), timeout=60)   # the ONLY connection
+    except (ValueError, OSError) as e:
+        print("bcurl: %s" % e, file=sys.stderr)
+        return 2
+    rc = 0
+    out = sys.stdout.buffer
+    try:
+        with sock:
+            for i, (_, _, path) in enumerate(targets):
+                status = fetch(sock, host, port, path, 2 * i + 1, verbose, out)
+                out.flush()
+                if status >= 400:
+                    rc = 1
+    except (B.ProtocolError, B.Truncated, OSError, KeyError, ValueError) as e:
+        print("bcurl: protocol/network error: %s" % e, file=sys.stderr)
+        return 2
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

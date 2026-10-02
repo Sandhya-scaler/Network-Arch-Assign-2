@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""bserve ROOT PORT -- BHTTP v1 file server (see SPEC.md)."""
+import email.utils, mimetypes, os, socket, sys, threading
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import bhttp as B
+
+SERVER_NAME = "bserve/1"
+mimetypes.add_type("text/html", ".html")
+
+
+def send_response(conn, stream, status, headers, body_iter):
+    hdrs = [(":status", str(status))] + headers
+    B.write_all(conn, B.pack_frame(B.T_RESPONSE, 0, stream, B.encode_headers(hdrs)))
+    pending = None
+    for chunk in body_iter:
+        if pending is not None:
+            B.write_all(conn, B.pack_frame(B.T_DATA, 0, stream, pending))
+        pending = chunk
+    B.write_all(conn, B.pack_frame(B.T_DATA, B.F_END_STREAM, stream, pending or b""))
+
+
+def send_error(conn, stream, status, text):
+    body = (text + "\n").encode()
+    send_response(conn, stream, status,
+                  [("content-type", "text/plain"), ("content-length", str(len(body))),
+                   ("server", SERVER_NAME)], [body])
+
+
+def fatal(conn, stream, text):
+    """Framing is untrustworthy: send 400, half-close, drain input so the peer
+    sees the reply instead of a TCP reset, then the caller closes."""
+    try:
+        send_error(conn, stream, 400, text)
+        conn.shutdown(socket.SHUT_WR)
+        conn.settimeout(2)
+        left = 1 << 20
+        while left > 0:
+            c = conn.recv(65536)
+            if not c:
+                break
+            left -= len(c)
+    except OSError:
+        pass
+
+
+def file_chunks(f):
+    while True:
+        c = f.read(B.DATA_CHUNK)
+        if not c:
+            return
+        yield c
+
+
+def resolve(root, path):
+    """Return a filesystem path under root, None if outside/nonexistent.
+    Raises ProtocolError for syntactically bad paths."""
+    if not path.startswith("/") or "\0" in path or "\\" in path:
+        raise B.ProtocolError("bad path")
+    if ".." in path.split("/"):
+        raise B.ProtocolError("path traversal")
+    full = os.path.realpath(os.path.join(root, path.lstrip("/")))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+def handle_request(conn, root, stream, payload):
+    try:
+        hdrs = dict(B.decode_headers(payload))
+        method, path = hdrs.get(":method"), hdrs.get(":path")
+        if method is None or path is None:
+            raise B.ProtocolError("missing :method or :path")
+        if method != "GET":
+            raise B.ProtocolError("unsupported method")
+        if stream == 0:
+            raise B.ProtocolError("stream id 0")
+        full = resolve(root, path)
+    except B.ProtocolError as e:
+        send_error(conn, stream, 400, "bad request: %s" % e)
+        return
+    if full is not None and os.path.isdir(full):
+        full = os.path.join(full, "index.html")
+    try:
+        f = open(full, "rb") if full else None
+        if f and not os.path.isfile(full):
+            f.close(); f = None
+    except OSError:
+        f = None
+    if f is None:
+        send_error(conn, stream, 404, "not found")
+        return
+    with f:
+        st = os.fstat(f.fileno())
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        send_response(conn, stream, 200,
+                      [("content-type", ctype), ("content-length", str(st.st_size)),
+                       ("server", SERVER_NAME),
+                       ("last-modified", email.utils.formatdate(st.st_mtime, usegmt=True))],
+                      file_chunks(f))
+
+
+def serve_connection(conn, root):
+    try:
+        conn.settimeout(300)
+        while True:
+            try:
+                hdr = B.read_header(conn)
+            except B.ProtocolError as e:
+                # cannot trust framing any more: report and close
+                fatal(conn, 0, "bad frame: %s" % e)
+                return
+            if hdr is None:
+                return
+            _, ftype, _, stream, length = hdr
+            if ftype != B.T_REQUEST:
+                B.skip_exact(conn, length)      # unknown/irrelevant frame: skip
+                continue
+            if length > B.MAX_HEADER_PAYLOAD:
+                fatal(conn, stream, "request frame too large")
+                return
+            payload = B.read_exact(conn, length) if length else b""
+            handle_request(conn, root, stream, payload)
+    except (B.Truncated, OSError):
+        pass
+    finally:
+        conn.close()
+
+
+def main():
+    if len(sys.argv) != 3 or not sys.argv[2].isdigit():
+        sys.exit("usage: bserve ROOT PORT")
+    root = os.path.realpath(sys.argv[1])
+    if not os.path.isdir(root):
+        sys.exit("bserve: %s is not a directory" % sys.argv[1])
+    port = int(sys.argv[2])
+    try:
+        srv = socket.create_server(("", port), family=socket.AF_INET6, dualstack_ipv6=True)
+    except (OSError, ValueError):
+        srv = socket.create_server(("", port))
+    print("bserve: serving %s on port %d" % (root, srv.getsockname()[1]),
+          file=sys.stderr, flush=True)
+    try:
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=serve_connection, args=(conn, root), daemon=True).start()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
